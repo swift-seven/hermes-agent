@@ -1031,17 +1031,13 @@ class TestExclusiveBindTimeWait:
 # Regression coverage for #72041: profile-bound webhook authentication
 class TestMultiplexProfileWebhookAuthentication:
     @staticmethod
-    def _configure_profiles(adapter, tmp_path, monkeypatch):
+    def _configure_profiles(adapter, monkeypatch):
         runner = MagicMock()
         runner.config.multiplex_profiles = True
         adapter.gateway_runner = runner
         monkeypatch.setattr(
-            "hermes_cli.profiles.profiles_to_serve",
-            lambda multiplex: [
-                ("default", tmp_path),
-                ("worker", tmp_path / "profiles" / "worker"),
-                ("other", tmp_path / "profiles" / "other"),
-            ],
+            "hermes_cli.profiles.profile_is_served",
+            lambda name, multiplex: name in {"default", "worker", "other"},
         )
 
     @staticmethod
@@ -1064,9 +1060,7 @@ class TestMultiplexProfileWebhookAuthentication:
         }
 
     @pytest.mark.asyncio
-    async def test_route_secret_is_bound_to_named_profile(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_route_secret_is_bound_to_named_profile(self, monkeypatch):
         route_secret = "worker-route-secret-abc123"
         adapter = _make_adapter(
             routes={
@@ -1079,7 +1073,7 @@ class TestMultiplexProfileWebhookAuthentication:
             },
             host="127.0.0.1",
         )
-        self._configure_profiles(adapter, tmp_path, monkeypatch)
+        self._configure_profiles(adapter, monkeypatch)
         body = b'{"action":"opened"}'
         headers = self._headers(body, route_secret)
 
@@ -1139,7 +1133,7 @@ class TestMultiplexProfileWebhookAuthentication:
             },
             host="127.0.0.1",
         )
-        self._configure_profiles(adapter, tmp_path, monkeypatch)
+        self._configure_profiles(adapter, monkeypatch)
         seen = []
 
         async def _capture(event):
