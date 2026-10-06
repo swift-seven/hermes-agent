@@ -159,6 +159,8 @@ from gateway.platforms._shared import coerce_port as _coerce_port
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
 from gateway.platforms.tcp_site import start_tcp_site
 from hermes_state_errors import SessionActiveWriteGuardError
+from hermes_state_sessions import _parse_model_config
+from agent.usage_anchor import USAGE_ANCHOR_MODEL_CONFIG_KEY
 
 
 logger = logging.getLogger(__name__)
@@ -3041,7 +3043,23 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # Full system prompts / model_config never cross the client API; only their presence.
         payload["has_system_prompt"] = bool(session.get("system_prompt"))
         payload["has_model_config"] = bool(session.get("model_config"))
+        payload["context_tokens"] = APIServerAdapter._context_tokens(session.get("model_config"))
         return payload
+
+    @staticmethod
+    def _context_tokens(model_config: Any) -> Optional[int]:
+        """Prompt + completion tokens of the session's last model call — the context it now holds —
+        from the persisted usage anchor; None before the first reported usage or after a compaction
+        that has not been followed by a call yet."""
+        anchor = _parse_model_config(model_config).get(USAGE_ANCHOR_MODEL_CONFIG_KEY)
+        if not isinstance(anchor, dict):
+            return None
+        try:
+            prompt = int(anchor.get("prompt_tokens") or 0)
+            completion = int(anchor.get("completion_tokens") or 0)
+        except (TypeError, ValueError):
+            return None
+        return prompt + max(0, completion) if prompt > 0 else None
 
     @staticmethod
     def _message_response(message: Dict[str, Any]) -> Dict[str, Any]:

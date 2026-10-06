@@ -1294,3 +1294,24 @@ async def test_interim_commentary_reaches_session_sse_and_responses_stream(adapt
     monkeypatch.setattr("run_agent.AIAgent", CapturingAgent)
     adapter._create_agent(session_id="gated", interim_assistant_callback=lambda *_a, **_k: None)
     assert captured["interim_assistant_callback"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_session_reports_the_context_its_last_call_held(adapter, session_db):
+    session_id = session_db.create_session("context-tokens", "api_server")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(f"/api/sessions/{session_id}")
+        assert resp.status == 200
+        assert (await resp.json())["session"]["context_tokens"] is None
+
+        session_db.patch_session_model_config(session_id, {"_usage_anchor": {
+            "prompt_tokens": 48000, "completion_tokens": 210, "base_count": 3,
+            "base_last_role": "assistant", "base_last_fp": "fp", "base_prefix_fp": "pfp"}})
+        resp = await cli.get(f"/api/sessions/{session_id}")
+        assert (await resp.json())["session"]["context_tokens"] == 48210
+
+        session_db.patch_session_model_config(session_id, {"_usage_anchor": None})
+        resp = await cli.get(f"/api/sessions/{session_id}")
+        assert (await resp.json())["session"]["context_tokens"] is None
