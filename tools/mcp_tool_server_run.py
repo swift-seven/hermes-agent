@@ -57,20 +57,21 @@ class MCPServerRunMixin:
 
     async def _wait_for_lifecycle_event(self) -> str:
         """Serve until a lifecycle event: ``"shutdown"`` (exits run), ``"reconnect"`` (session torn
-        down, transport re-entered; event cleared first) or ``"recycle"`` (stdio idle/lifetime
-        limit; restarts lazily on next call). Shutdown wins a tie. Remote transports run a
-        keepalive (``ping``, with a ``list_tools`` fallback for servers lacking the optional ping
-        utility — see :meth:`_keepalive_probe`) every ``keepalive_interval`` (which must stay
-        below the server's session TTL) so idle TCP/session state never goes stale (#17003);
-        stdio does so only when explicitly configured. A keepalive failure triggers a reconnect.
+        down, transport re-entered; event cleared first) or ``"recycle"`` (idle/lifetime limit;
+        restarts lazily on next call). Shutdown wins a tie. Remote transports run a keepalive
+        (``ping``, with a ``list_tools`` fallback for servers lacking the optional ping utility —
+        see :meth:`_keepalive_probe`) every ``keepalive_interval`` (which must stay below the
+        server's session TTL) so idle TCP/session state never goes stale (#17003); stdio does so
+        only when explicitly configured. A keepalive failure triggers a reconnect.
+        ``keepalive_interval: 0`` turns the keepalive off: for a server that holds resources per
+        open session a ping is activity, and a failed one reconnects a session nobody is using.
         """
         is_http = self._is_http()
         configured = self._config.get("keepalive_interval")
         keepalive_interval = None
         if is_http or configured is not None:
-            keepalive_interval = max(
-                _core._MIN_KEEPALIVE_INTERVAL,
-                float(_core._DEFAULT_KEEPALIVE_INTERVAL if configured is None else configured))
+            interval = float(_core._DEFAULT_KEEPALIVE_INTERVAL if configured is None else configured)
+            keepalive_interval = max(_core._MIN_KEEPALIVE_INTERVAL, interval) if interval > 0 else None
         # No keepalive, but an unproven stdio session must still get its chance to prove
         # itself: it counts as proven only once a FULL default interval has elapsed — not on
         # the first timeout wake, which a shorter recycle deadline may cause (see below).
@@ -91,11 +92,11 @@ class MCPServerRunMixin:
                 if recycle_deadline is not None:
                     recycle_timeout = max(0.0, recycle_deadline - time.monotonic())
                     timeout = recycle_timeout if timeout is None else min(timeout, recycle_timeout)
-                elif not is_http and self._rpc_lock.locked():
+                elif self._rpc_lock.locked():
                     # Recycle deadlines are intentionally hidden while an RPC is active. Without
-                    # a default stdio keepalive timeout, lock release must wake this loop so the
-                    # now-visible deadline is evaluated instead of waiting forever. (For a stdio
-                    # server with no limits the wake is a harmless extra iteration.)
+                    # a keepalive timeout, lock release must wake this loop so the now-visible
+                    # deadline is evaluated instead of waiting forever. (For a server with no
+                    # limits, or one still pinging, the wake is a harmless extra iteration.)
                     rpc_idle_task = rpc_idle_task or asyncio.ensure_future(self._wait_for_rpc_idle())
                 waiters = [t for t in (shutdown_task, reconnect_task, rpc_idle_task) if t is not None]
                 done, _pending = await asyncio.wait(
@@ -375,12 +376,12 @@ class MCPServerRunMixin:
                 self._stdio_child_pids = set()
 
     async def _on_clean_return(self, lifecycle_reason: str, budget: "_RetryBudget") -> bool:
-        """Clean transport return: shutdown, stdio recycle, or a requested rebuild (not a failure
-        for the retry counters)."""
+        """Clean transport return: shutdown, recycle, or a requested rebuild (not a failure for the
+        retry counters)."""
         if self._shutdown_event.is_set():
             return False
         if lifecycle_reason == "recycle":
-            logger.info("MCP server '%s': stdio session recycled after %s; waiting for lazy reconnect",
+            logger.info("MCP server '%s': session recycled after %s; waiting for lazy reconnect",
                         self.name, self._recycled_reason)
             self.session = None
             # Dormant until a lazy call wakes it (untimed: nothing to self-probe).
@@ -444,7 +445,7 @@ class MCPServerRunMixin:
         root = _errors._unwrap_exception_group(exc)
         failure_class = _errors._classify_mcp_failure(root)
         if self._is_recycled_stdio():
-            logger.warning("MCP server '%s': lazy reconnect after stdio recycle failed, marking unavailable "
+            logger.warning("MCP server '%s': lazy reconnect after recycle failed, marking unavailable "
                            "while retrying: %s: %s", self.name, type(root).__name__, root)
             self._recycled_reason = None
         # Initial-connect ladder (a startup blip must not kill the server); gated on

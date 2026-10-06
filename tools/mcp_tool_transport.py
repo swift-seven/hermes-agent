@@ -245,15 +245,13 @@ class MCPServerTransportMixin:
         await session.send_notification(types.InitializedNotification())
         return result
 
-    async def _serve_session(self, session, connect_timeout: float,
-                             label: str = "", mark_lifecycle: bool = False) -> str:
+    async def _serve_session(self, session, connect_timeout: float, label: str = "") -> str:
         """Handshake, discover, publish readiness, then serve until a lifecycle event. Clears stale
         breaker state but leaves the session UNPROVEN: flapping transports handshake fine and drop
         moments later, so only keepalive/tool-call success clears the reconnect budget."""
         self.initialize_result = await self._negotiate_session(session, connect_timeout)
         self.session = session
-        if mark_lifecycle:
-            self._mark_lifecycle_started()
+        self._mark_lifecycle_started()
         await self._discover_tools()
         self._ready.set()
         self._ever_connected = True
@@ -403,7 +401,7 @@ class MCPServerTransportMixin:
                     # Bound the handshake here (``connect_timeout`` only bounds the caller's ``.result()``):
                     # a server that never answers ``initialize`` would leak child + pipes per retry until EMFILE.
                     connect_timeout = float(config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
-                    return await self._serve_session(session, connect_timeout, mark_lifecycle=True)
+                    return await self._serve_session(session, connect_timeout)
         except Exception as exc:
             # The SDK only sees "Connection closed"; the child's stderr says why (#124264).
             abi_error = node_abi_error(self.name, await asyncio.to_thread(stderr.close))

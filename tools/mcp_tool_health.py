@@ -1,6 +1,6 @@
 """Session health for MCPServerTask: dynamic tool refresh on list_changed notifications, server
 log forwarding, keepalive probes, suspect-mark / lazy-verify, in-flight call fail-fast, stdio
-child liveness and stdio idle/lifetime recycling."""
+child liveness and idle/lifetime recycling."""
 
 import asyncio
 import json
@@ -26,8 +26,8 @@ class MCPServerHealthMixin:
         return "url" in self._config
 
     def _is_recycled_stdio(self) -> bool:
-        """True when a stdio server was intentionally recycled."""
-        return not self._is_http() and self._recycled_reason is not None
+        """True when the session was intentionally recycled (stdio or HTTP; the name predates HTTP)."""
+        return self._recycled_reason is not None
 
     def mark_tool_call(self) -> None:
         """Record that a user-visible MCP operation is starting."""
@@ -38,15 +38,15 @@ class MCPServerHealthMixin:
         self._recycled_reason = None
 
     def _stdio_recycle_deadlines(self):
-        """``[(deadline, reason), ...]`` for the lifetime/idle limits; empty for HTTP or while an RPC holds the lock."""
-        if self._is_http() or self._rpc_lock.locked():
+        """``[(deadline, reason), ...]`` for the lifetime/idle limits; empty while an RPC holds the lock."""
+        if self._rpc_lock.locked():
             return []
         limits = ((self._lifecycle_started_at, self._max_lifetime_seconds, "max_lifetime_seconds"),
                   (self._last_tool_call_at, self._idle_timeout_seconds, "idle_timeout_seconds"))
         return [(start + limit, reason) for start, limit, reason in limits if limit is not None]
 
     def _stdio_recycle_reason(self, now: Optional[float] = None) -> Optional[str]:
-        """The stdio recycle reason if idle/age limits have elapsed (lifetime wins), else None."""
+        """The recycle reason if idle/age limits have elapsed (lifetime wins), else None."""
         now = time.monotonic() if now is None else now
         return next((reason for deadline, reason in self._stdio_recycle_deadlines() if now >= deadline), None)
 
@@ -54,7 +54,7 @@ class MCPServerHealthMixin:
         return min((d for d, _ in self._stdio_recycle_deadlines()), default=None)
 
     def _mark_stdio_recycled(self, reason: str) -> None:
-        """Mark a stdio session dormant before its transport finishes closing."""
+        """Mark a session dormant before its transport finishes closing."""
         self._recycled_reason = reason
         self.session = None
 

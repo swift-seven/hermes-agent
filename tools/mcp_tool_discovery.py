@@ -344,7 +344,9 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 def _select_new_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
     """Pick connect candidates (enabled, not connected/connecting/lazy, not in backoff) and
     refresh per-server bookkeeping. Known servers without a live session are parked or
-    mid-reconnect with tools deregistered, so nothing else can nudge them: signal a reconnect."""
+    mid-reconnect with tools deregistered, so nothing else can nudge them: signal a reconnect.
+    A recycled server is the exception: its tools stay offered and its first call reconnects it,
+    so a nudge here would reopen an idle session on every run start or reconcile pass."""
     with _core._lock:
         current_scope = _core._mcp_registry_scope()
         # This scope's own connections OR shared ones it adopted (``register_connected_into_current_scope``
@@ -361,7 +363,8 @@ def _select_new_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
             and mcp_server_enabled(v) and not _connect_cooldown_active(k)}
         stale_cached = [_core._servers[keys[k]] for k, v in servers.items()
                         if keys[k] in _core._servers and mcp_server_enabled(v)
-                        and getattr(_core._servers[keys[k]], "session", None) is None]
+                        and getattr(_core._servers[keys[k]], "session", None) is None
+                        and getattr(_core._servers[keys[k]], "_recycled_reason", None) is None]
         for srv_name in new_servers:
             _core._server_connecting.add(keys[srv_name])
             _core._server_scope_keys[keys[srv_name]] = current_scope
