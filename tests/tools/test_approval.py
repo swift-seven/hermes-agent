@@ -989,6 +989,31 @@ class TestWebhookApprovalExclusion:
         assert result["approved"] is False
         assert "approvals.unattended_mode" in result["message"]
 
+    def test_api_server_is_attended_when_the_profile_says_so(self, monkeypatch):
+        """``approvals.api_server_interactive`` routes api_server approvals to the client."""
+        import hermes_cli.config as config
+        from tools.approval import _is_gateway_approval_context
+
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "api_server")
+        monkeypatch.setattr(config, "load_config_readonly",
+                            lambda: {"approvals": {"api_server_interactive": True}})
+
+        assert _is_gateway_approval_context() is True
+
+    def test_the_api_server_switch_leaves_other_unattended_platforms_alone(self, monkeypatch):
+        import hermes_cli.config as config
+        from tools.approval import _is_gateway_approval_context
+
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "webhook")
+        monkeypatch.setattr(config, "load_config_readonly",
+                            lambda: {"approvals": {"api_server_interactive": True}})
+
+        assert _is_gateway_approval_context() is False
+
 
 class TestNormalizationBypass:
     """Obfuscation techniques must not bypass dangerous command detection."""

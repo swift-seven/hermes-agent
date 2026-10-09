@@ -141,8 +141,24 @@ def _is_unattended_platform_approval_context() -> bool:
     do, but there is no human who can resolve a pending approval. Treating them as gateway approval contexts
     blocks the session for the full approval timeout (60-300s) and then fails closed anyway — the deadlock
     in #37284/#87509.
+
+    ``approvals.api_server_interactive: true`` is the operator stating that this profile's api_server
+    client relays ``approval.request`` to a person and answers ``POST /v1/runs/{id}/approval``, so its
+    sessions are attended and go through the normal gateway approval flow.
     """
-    return _get_session_platform() in _UNATTENDED_APPROVAL_PLATFORMS
+    platform = _get_session_platform()
+    if platform == "api_server" and _api_server_interactive():
+        return False
+    return platform in _UNATTENDED_APPROVAL_PLATFORMS
+
+
+def _api_server_interactive() -> bool:
+    try:
+        from hermes_cli.config import load_config_readonly
+        return is_truthy_value(cfg_get(load_config_readonly(), "approvals", "api_server_interactive",
+                                       default=False))
+    except Exception:
+        return False
 
 
 def _is_single_query_approval_context() -> bool:
