@@ -104,6 +104,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
+    app.router.add_post("/v1/runs/{run_id}/clarify", adapter._handle_run_clarify)
     app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_steer_run)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
@@ -2620,3 +2621,180 @@ class TestRunEventsHeadFlush:
             assert first, "no body byte arrived before the first event"
 
             resp.close()
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/runs/{run_id}/clarify — clarify questions answered by the client
+# ---------------------------------------------------------------------------
+
+
+_CLARIFY_QUESTIONS = [
+    {"question": "Which period?", "choices": ["Last week", "Last month"]},
+    {"question": "Which regions?", "choices": ["North", "South", "East"], "multi_select": True},
+    {"question": "Anything else?"},
+]
+
+
+def _clarifying_agent(captured):
+    """A mock agent whose turn calls the real clarify tool with the run's callback."""
+    from tools.clarify_tool import clarify_tool
+
+    agent = MagicMock()
+    agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+
+    def _run(user_message=None, conversation_history=None, task_id=None):
+        result = clarify_tool(question="", questions=_CLARIFY_QUESTIONS, callback=captured["clarify_callback"])
+        captured["result"] = json.loads(result)
+        return {"final_response": "done"}
+
+    agent.run_conversation.side_effect = _run
+    return agent
+
+
+async def _wait_status(cli, run_id, wanted, attempts=100):
+    for _ in range(attempts):
+        status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+        if status["status"] in wanted:
+            return status
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"run {run_id} never reached {wanted}: {status}")
+
+
+class TestRunClarify:
+    @pytest.mark.asyncio
+    async def test_not_offered_without_opt_in(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.platforms.api_server_runs._clarify_interactive", return_value=False), \
+                    patch.object(adapter, "_create_agent") as mock_create:
+                mock_create.return_value = _make_slow_agent()[0]
+                mock_create.return_value.run_conversation.side_effect = None
+                mock_create.return_value.run_conversation.return_value = {"final_response": "ok"}
+                run_id = (await (await cli.post("/v1/runs", json={"input": "hi"})).json())["run_id"]
+                await _wait_status(cli, run_id, {"completed"})
+                assert mock_create.call_args.kwargs["clarify_callback"] is None
+
+    @pytest.mark.asyncio
+    async def test_answers_reach_the_tool(self, adapter):
+        app = _create_runs_app(adapter)
+        captured = {}
+
+        def _create(**kwargs):
+            captured.update(kwargs)
+            return _clarifying_agent(captured)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.platforms.api_server_runs._clarify_interactive", return_value=True), \
+                    patch.object(adapter, "_create_agent", side_effect=_create):
+                run_id = (await (await cli.post("/v1/runs", json={"input": "hi"})).json())["run_id"]
+                stream = asyncio.ensure_future((await cli.get(f"/v1/runs/{run_id}/events")).text())
+                status = await _wait_status(cli, run_id, {"waiting_for_clarify"})
+                pending = status["clarify"]
+                assert pending["event"] == "clarify.request"
+                assert [q["qid"] for q in pending["questions"]] == ["q0", "q1", "q2"]
+                assert pending["questions"][0]["choices"][0] == "Last week (Recommended)"
+                assert pending["questions"][1]["multi_select"] is True
+
+                resp = await cli.post(f"/v1/runs/{run_id}/clarify", json={
+                    "clarify_id": pending["clarify_id"],
+                    "answers": {"q0": "Last month", "q1": ["North", "East"]}})
+                assert resp.status == 200
+                assert (await resp.json())["answered"] == 2
+
+                status = await _wait_status(cli, run_id, {"completed"})
+                assert "clarify" not in status
+                responses = captured["result"]["responses"]
+                assert [r["user_response"] for r in responses] == ["Last month", ["North", "East"], ""]
+                assert "timed_out" not in captured["result"]
+                events = [json.loads(line[len("data:"):])["event"]
+                          for line in (await asyncio.wait_for(stream, 5)).splitlines()
+                          if line.startswith("data:")]
+                assert events.index("clarify.request") < events.index("clarify.responded") \
+                    < events.index("run.completed")
+
+    @pytest.mark.asyncio
+    async def test_client_notice_reaches_the_agent(self, adapter):
+        app = _create_runs_app(adapter)
+        captured = {}
+
+        def _create(**kwargs):
+            captured.update(kwargs)
+            return _clarifying_agent(captured)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.platforms.api_server_runs._clarify_interactive", return_value=True), \
+                    patch.object(adapter, "_create_agent", side_effect=_create):
+                run_id = (await (await cli.post("/v1/runs", json={"input": "hi"})).json())["run_id"]
+                pending = (await _wait_status(cli, run_id, {"waiting_for_clarify"}))["clarify"]
+                resp = await cli.post(f"/v1/runs/{run_id}/clarify", json={
+                    "clarify_id": pending["clarify_id"], "answers": {},
+                    "timed_out": True, "notice": "The analyst closed the chat."})
+                assert resp.status == 200
+                await _wait_status(cli, run_id, {"completed"})
+                assert captured["result"]["timed_out"] is True
+                assert captured["result"]["notice"] == "The analyst closed the chat."
+
+    @pytest.mark.asyncio
+    async def test_rejects_stale_id_and_malformed_answers(self, adapter):
+        app = _create_runs_app(adapter)
+        captured = {}
+
+        def _create(**kwargs):
+            captured.update(kwargs)
+            return _clarifying_agent(captured)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.platforms.api_server_runs._clarify_interactive", return_value=True), \
+                    patch.object(adapter, "_create_agent", side_effect=_create):
+                run_id = (await (await cli.post("/v1/runs", json={"input": "hi"})).json())["run_id"]
+                pending = (await _wait_status(cli, run_id, {"waiting_for_clarify"}))["clarify"]
+                url = f"/v1/runs/{run_id}/clarify"
+                cid = pending["clarify_id"]
+
+                stale = await cli.post(url, json={"clarify_id": "clarify_other", "answers": {}})
+                assert stale.status == 409
+                assert (await stale.json())["error"]["code"] == "clarify_not_pending"
+                for answers in ({"q9": "x"}, {"q0": ["Last week", "Last month"]}, {"q2": 7}, ["q0"]):
+                    bad = await cli.post(url, json={"clarify_id": cid, "answers": answers})
+                    assert bad.status == 400, answers
+                assert (await _wait_status(cli, run_id, {"waiting_for_clarify"}))["clarify"]["clarify_id"] == cid
+
+                assert (await cli.post(url, json={"clarify_id": cid, "answers": {"q0": "Last week"}})).status == 200
+                await _wait_status(cli, run_id, {"completed"})
+                again = await cli.post(url, json={"clarify_id": cid, "answers": {}})
+                assert again.status == 409
+
+    @pytest.mark.asyncio
+    async def test_stop_releases_a_pending_question(self, adapter):
+        app = _create_runs_app(adapter)
+        captured = {}
+
+        def _create(**kwargs):
+            captured.update(kwargs)
+            agent = _clarifying_agent(captured)
+            inner = agent.run_conversation.side_effect
+
+            def _run(**kw):
+                inner(**kw)
+                return {"final_response": "", "interrupted": True}
+
+            agent.run_conversation.side_effect = _run
+            return agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.platforms.api_server_runs._clarify_interactive", return_value=True), \
+                    patch.object(adapter, "_create_agent", side_effect=_create):
+                run_id = (await (await cli.post("/v1/runs", json={"input": "hi"})).json())["run_id"]
+                stream = asyncio.ensure_future((await cli.get(f"/v1/runs/{run_id}/events")).text())
+                await _wait_status(cli, run_id, {"waiting_for_clarify"})
+                started = time.monotonic()
+                assert (await cli.post(f"/v1/runs/{run_id}/stop")).status == 200
+                status = await _wait_status(cli, run_id, {"cancelled"})
+                assert time.monotonic() - started < 5
+                assert "clarify" not in status
+                assert captured["result"]["timed_out"] is True
+                responded = [json.loads(line[len("data:"):])
+                             for line in (await asyncio.wait_for(stream, 5)).splitlines()
+                             if line.startswith("data:") and "clarify.responded" in line]
+                assert [(e["timed_out"], e["stopped"]) for e in responded] == [(False, True)]
+

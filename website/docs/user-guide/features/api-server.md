@@ -564,6 +564,37 @@ Resolve a pending approval for a run that is waiting on a human decision (for ex
 
 MCP trust-gate consent — a write-capable tool on a server configured `trust: untrusted` — surfaces the same way: the run emits an `approval.request` event and parks in `waiting_for_approval` until this endpoint resolves it (`once` runs the tool, `deny` blocks it).
 
+### POST /v1/runs/\{run_id\}/clarify
+
+Answer the questions the agent asked with the `clarify` tool. The api_server toolset leaves `clarify` out because most clients cannot answer it; a profile whose `/v1/runs` client can opts in:
+
+```yaml
+clarify:
+  api_server_interactive: true
+```
+
+With it, `/v1/runs` agents get the tool (unless `agent.disabled_toolsets` names `clarify`). Other api_server endpoints never offer it. When the agent asks, the run emits `clarify.request` and parks in `waiting_for_clarify`; the pending request is also on `GET /v1/runs/{run_id}` as `clarify`:
+
+```json
+{
+  "event": "clarify.request",
+  "clarify_id": "clarify_3f2a…",
+  "questions": [
+    {"qid": "q0", "question": "Which period?", "choices": ["Last week (Recommended)", "Last month"], "multi_select": false},
+    {"qid": "q1", "question": "Anything else?", "choices": null, "multi_select": false}
+  ],
+  "timeout_seconds": 3600
+}
+```
+
+The first choice carries the `(Recommended)` label when there are two or more; clients render their own "Other" free-text row. Answer with:
+
+```json
+{"clarify_id": "clarify_3f2a…", "answers": {"q0": "Last month"}}
+```
+
+A question left out of `answers` reaches the agent as skipped; a `multi_select` question takes a list. A client that knows nobody will answer (its user went away) sends `"timed_out": true` with an optional `notice` saying why, so the agent goes on with its own judgement instead of waiting out `agent.clarify_timeout`. The run emits `clarify.responded` (`clarify_id`, `timed_out`, `stopped`) when the wait ends for any reason; `stop` and gateway shutdown release a pending wait at once and report `stopped: true` rather than a timeout. A stale or already answered `clarify_id` gets `409 clarify_not_pending`.
+
 ## Jobs API (background scheduled work)
 
 The server exposes a lightweight jobs CRUD surface for managing scheduled / background agent runs from a remote client. All endpoints are gated behind the same bearer auth.
@@ -694,7 +725,7 @@ to the routed profile**:
 - A named profile with no `API_SERVER_KEY` of its own fails closed — its
   prefix is unreachable until you set one.
 - Runs are per-profile scoped: `/v1/runs/{run_id}` and its `events`, `stop`,
-  `steer`, and `approval` routes only answer for the profile that created
+  `steer`, `approval`, and `clarify` routes only answer for the profile that created
   the run (including runs started via `/api/sessions/{id}/chat/stream`);
   another profile's run id returns `404`, never `403`.
 

@@ -68,6 +68,7 @@ _BROWSER_CONTROL_PROTOCOL_VERSION = 1
 _STATIC_FEATURE_FLAGS = {
     "run_status": True, "run_events_sse": True, "run_stop": True, "run_steer": True,
     "run_approval_response": True, "tool_progress_events": True, "approval_events": True,
+    "run_clarify_response": True,
     "session_resources": True, "model_options": True, "session_chat": True,
     "session_chat_streaming": True, "session_fork": True, "session_model_lock": True,
     "reasoning_streaming": True,
@@ -84,6 +85,7 @@ _CAPABILITY_ENDPOINTS = (
     ("run_status", ("GET", "/v1/runs/{run_id}")),
     ("run_events", ("GET", "/v1/runs/{run_id}/events")),
     ("run_approval", ("POST", "/v1/runs/{run_id}/approval")),
+    ("run_clarify", ("POST", "/v1/runs/{run_id}/clarify")),
     ("run_steer", ("POST", "/v1/runs/{run_id}/steer")),
     ("run_stop", ("POST", "/v1/runs/{run_id}/stop")), ("skills", ("GET", "/v1/skills")),
     ("toolsets", ("GET", "/v1/toolsets")), ("sessions", ("GET", "/api/sessions")),
@@ -2385,7 +2387,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self, ephemeral_system_prompt: Optional[str] = None, session_id: Optional[str] = None,
         stream_delta_callback=None, tool_progress_callback=None, tool_start_callback=None,
         tool_complete_callback=None, interim_assistant_callback=None, reasoning_callback=None,
-        status_callback=None, gateway_session_key: Optional[str] = None,
+        status_callback=None, clarify_callback=None, gateway_session_key: Optional[str] = None,
         requested_model: Optional[str] = None, requested_provider: Optional[str] = None,
         model_options: Optional[Dict[str, Any]] = None, route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None, confirmed_runtime_lock: bool = False,
@@ -2429,6 +2431,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             policy = RoomExecutionPolicy.from_mapping(room_execution_policy or {})
             enabled_toolsets = list(policy.enabled_toolsets)
             max_iterations = policy.max_iterations
+        elif clarify_callback is not None:
+            # The api_server toolset leaves clarify out because most clients cannot answer it; a
+            # caller that wires a callback can, so the tool is offered to that agent only.
+            enabled_toolsets = sorted({*enabled_toolsets, "clarify"})
         # Reasoning resolves against the model that actually runs (per-model overrides), so only
         # after the precedence chain settles; an explicit request wins.
         if request_reasoning_config is None:
@@ -2446,6 +2452,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "interim_assistant_callback": interim_assistant_callback,
             "reasoning_callback": reasoning_callback,
             "status_callback": status_callback,
+            "clarify_callback": clarify_callback,
             "session_db": self._ensure_session_db(),
             # Same fallback provider chain as Telegram/Discord/Slack.
             "fallback_model": None if confirmed_runtime_lock else GatewayRunner._load_fallback_model(),
@@ -4451,6 +4458,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     _handle_get_run = _run_route_delegate("_handle_get_run")
     _handle_run_events = _run_route_delegate("_handle_run_events")
     _handle_run_approval = _run_route_delegate("_handle_run_approval")
+    _handle_run_clarify = _run_route_delegate("_handle_run_clarify")
     _handle_steer_run = _run_route_delegate("_handle_steer_run")
     _handle_stop_run = _run_route_delegate("_handle_stop_run")
 

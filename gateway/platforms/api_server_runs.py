@@ -96,6 +96,8 @@ _FIXED_EVENT_FIELDS = {
         "tool": tool, "duration": round(kw.get("duration", 0), 3), "error": kw.get("is_error", False)},
     "reasoning.available": lambda tool, preview, kw: {"text": preview or ""}}
 _TOOL_COMPLETED_PREVIEW_MAX_CHARS = 500
+_CLARIFY_ANSWER_MAX_CHARS = 8000
+_CLARIFY_NOTICE_MAX_CHARS = 500
 
 
 def _tool_completed_preview(result: Any, redact_sensitive_text: Callable[..., str]) -> str:
@@ -236,6 +238,7 @@ def _http_routes(self) -> list[tuple[str, str, Any]]:
         ("POST", "/v1/runs", self._handle_runs), ("GET", "/v1/runs/{run_id}", self._handle_get_run),
         ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
         ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
+        ("POST", "/v1/runs/{run_id}/clarify", self._handle_run_clarify),
         ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
         ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run)]
 
@@ -269,6 +272,8 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, 
         current.setdefault("shutdown_requested_at", shutdown_requested_at)
     if status != "waiting_for_approval":
         current.pop("approval", None)
+    if status != "waiting_for_clarify":
+        current.pop("clarify", None)
     self._run_statuses[run_id] = current
     should_persist = (
         status != previous_status
@@ -287,6 +292,7 @@ def _mark_shutdown_interrupted_runs(self, run_ids) -> None:
     """Publish the shutdown outcome before cooperative interruption can race teardown."""
     for run_id in run_ids:
         self._shutdown_interrupted_run_ids.add(run_id)
+        _release_clarify(run_id)
         self._set_run_status(
             run_id,
             "interrupted",
@@ -352,7 +358,7 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
 def _room_permission_for(request: "web.Request") -> str:
     if request.path.endswith("/stop"):
         return "stop"
-    if request.path.endswith("/approval"):
+    if request.path.endswith("/approval") or request.path.endswith("/clarify"):
         return "approve"
     return "status" if request.method == "GET" else "dispatch"
 
@@ -861,6 +867,80 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Di
     return _approval_notify
 
 
+def _clarify_interactive() -> bool:
+    """``clarify.api_server_interactive: true``: the profile's /v1/runs client shows
+    ``clarify.request`` to a person and answers ``POST /v1/runs/{id}/clarify``."""
+    try:
+        from agent.skill_utils import parse_config_string_list
+        from hermes_cli.config import cfg_get, load_config_readonly
+        from utils import is_truthy_value
+        config = load_config_readonly() or {}
+        if not is_truthy_value(cfg_get(config, "clarify", "api_server_interactive", default=False)):
+            return False
+        disabled = parse_config_string_list((config.get("agent") or {}).get("disabled_toolsets") or [])
+        return "clarify" not in disabled
+    except Exception:
+        return False
+
+
+def _make_clarify_callback(self, run: _RunLaunch) -> Callable[..., str]:
+    """Clarify bridge for one run: publish ``clarify.request``, park the run in
+    ``waiting_for_clarify``, block the agent thread until the client answers, the wait times
+    out, or a stop releases it. Batch calls get the tool's ``{answers, timed_out?, notice?}``
+    JSON; single-question calls get the bare answer or the tool's timeout sentinel."""
+    from tools import clarify_gateway
+    from tools.clarify_tool import TIMEOUT_RESPONSE
+    run_id, loop = run.run_id, asyncio.get_running_loop()
+    timeout = clarify_gateway.get_clarify_timeout()
+
+    def _publish(event: Dict[str, Any]) -> None:
+        with suppress(Exception):
+            loop.call_soon_threadsafe(run.put_event, event)
+
+    def _clarify(question, choices, multi_select=False, questions=None) -> str:
+        if questions:
+            wire = [{"qid": e["qid"], "question": e["question"], "choices": e["choices"],
+                     "multi_select": bool(e["multi_select"])} for e in questions]
+        else:
+            wire = [{"qid": "q0", "question": question, "choices": choices,
+                     "multi_select": bool(multi_select) and bool(choices)}]
+        clarify_id = f"clarify_{uuid.uuid4().hex}"
+        clarify_gateway.register(clarify_id, run_id, wire[0]["question"], None)
+        event = _run_event(run_id, "clarify.request", clarify_id=clarify_id, questions=wire,
+                           timeout_seconds=timeout)
+        self._set_run_status(run_id, "waiting_for_clarify", last_event="clarify.request", clarify=event)
+        _publish(event)
+        raw = clarify_gateway.wait_for_response(clarify_id, timeout)
+        reply = None
+        with suppress(Exception):
+            reply = json.loads(raw) if raw else None
+        if not isinstance(reply, dict):
+            reply = {"answers": {}, "timed_out": True}
+        stopped = run_id in self._stopping_run_ids or run_id in self._shutdown_interrupted_run_ids
+        timed_out = bool(reply.get("timed_out")) and not stopped
+        if self._run_statuses.get(run_id, {}).get("status") == "waiting_for_clarify":
+            self._set_run_status(run_id, "running", last_event="clarify.responded")
+        _publish(_run_event(run_id, "clarify.responded", clarify_id=clarify_id, timed_out=timed_out,
+                            stopped=stopped))
+        if questions:
+            return json.dumps(reply, ensure_ascii=False)
+        if timed_out:
+            return TIMEOUT_RESPONSE
+        answer = (reply.get("answers") or {}).get("q0")
+        if isinstance(answer, list):
+            return json.dumps(answer, ensure_ascii=False)
+        return answer if isinstance(answer, str) else ""
+
+    return _clarify
+
+
+def _release_clarify(run_id: str) -> None:
+    """Unblock a run's pending clarify wait (no-op when none is pending)."""
+    with suppress(Exception):
+        from tools import clarify_gateway
+        clarify_gateway.clear_session(run_id)
+
+
 async def _execute_run_via_live_owner(self, run: _RunLaunch, home, record: Dict[str, Any], *, _api_server) -> None:
     """Drive a run whose turn a live Bot Chat owner is executing, from that owner's mailbox receipt.
 
@@ -959,9 +1039,11 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             return
         await _submit_api_worker(loop, lambda: self._ensure_mcp_tools_registered(run.request_profile))
         with self._profile_scope(run.request_profile):
+            clarify_cb = (_make_clarify_callback(self, run)
+                          if run.agent_kwargs.get("room_dispatch") is None and _clarify_interactive() else None)
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
-                interim_assistant_callback=_interim_cb, **run.agent_kwargs)
+                interim_assistant_callback=_interim_cb, clarify_callback=clarify_cb, **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage, served_runtime = await _submit_api_worker(
@@ -999,6 +1081,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         # On cancellation (/stop) the executor thread may still block on an approval
         # Event; unregistering releases it. Idempotent on normal completion.
         _unregister_approval_notify(run.approval_session_key)
+        _release_clarify(run_id)
         with suppress(Exception):
             loop.call_soon(run.put_event, None)  # close after the queued events
         _retire_live_run(self, run_id)
@@ -1217,6 +1300,70 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
         "resolved": resolved})
 
 
+async def _handle_run_clarify(self, request: "web.Request", *, _api_server) -> "web.Response":
+    """POST /v1/runs/{run_id}/clarify — answer the run's pending clarify questions.
+
+    Body: ``{"clarify_id", "answers": {qid: str | [str]}, "timed_out"?, "notice"?}``. A question
+    left out of ``answers`` is skipped; ``timed_out`` with a ``notice`` tells the agent why nobody
+    answered (the client went away) instead of letting the wait run to its timeout."""
+    _openai_error = _api_server._openai_error
+    run_id, status, _, _, err = _load_owned_run(
+        self, request, _api_server=_api_server, permission="approve", active_fallback=False)
+    if err is not None:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_error(_openai_error, "Invalid JSON", status=400)
+    if not isinstance(body, dict):
+        return _json_error(_openai_error, "Expected a JSON object", code="invalid_clarify_response", status=400)
+    pending = status.get("clarify") if status.get("status") == "waiting_for_clarify" else None
+    if not pending or body.get("clarify_id") != pending.get("clarify_id"):
+        return _json_error(
+            _openai_error, f"Run has no pending clarify with that id: {run_id}",
+            code="clarify_not_pending", status=409)
+    questions = {q["qid"]: q for q in pending.get("questions") or []}
+    answers = body.get("answers") or {}
+    notice = body.get("notice")
+    error = None
+    if not isinstance(answers, dict):
+        error = "answers must be an object keyed by question id."
+    elif notice is not None and (not isinstance(notice, str) or len(notice) > _CLARIFY_NOTICE_MAX_CHARS):
+        error = f"notice must be text of at most {_CLARIFY_NOTICE_MAX_CHARS} characters."
+    cleaned: Dict[str, Any] = {}
+    for qid, value in answers.items() if error is None else ():
+        question = questions.get(qid)
+        many = isinstance(value, list)
+        values = value if many else [value]
+        if question is None:
+            error = f"Unknown question id: {qid}"
+        elif many and not question.get("multi_select"):
+            error = f"Question {qid} takes a single answer."
+        elif not all(isinstance(v, str) and len(v) <= _CLARIFY_ANSWER_MAX_CHARS for v in values):
+            error = f"Answers to {qid} must be text of at most {_CLARIFY_ANSWER_MAX_CHARS} characters."
+        else:
+            kept = [v.strip() for v in values if v.strip()]
+            if kept:
+                cleaned[qid] = kept if many else kept[0]
+            continue
+        break
+    if error is not None:
+        return _json_error(_openai_error, error, code="invalid_clarify_response", status=400)
+    reply: Dict[str, Any] = {"answers": cleaned}
+    if _api_server._coerce_request_bool(body.get("timed_out"), default=False):
+        reply["timed_out"] = True
+        if notice and notice.strip():
+            reply["notice"] = notice.strip()
+    from tools import clarify_gateway
+    if not clarify_gateway.resolve_gateway_clarify(pending["clarify_id"], json.dumps(reply, ensure_ascii=False)):
+        return _json_error(
+            _openai_error, f"Run has no pending clarify with that id: {run_id}",
+            code="clarify_not_pending", status=409)
+    return web.json_response({
+        "object": "hermes.run.clarify_response", "run_id": run_id, "clarify_id": pending["clarify_id"],
+        "answered": len(cleaned), "timed_out": bool(reply.get("timed_out"))})
+
+
 async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs/{run_id}/steer — inject guidance into a running agent."""
     _openai_error = _api_server._openai_error
@@ -1266,6 +1413,7 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
             code="run_not_active", status=409)
     self._set_run_status(run_id, "stopping", last_event="run.stopping")
     self._stopping_run_ids.add(run_id)
+    _release_clarify(run_id)
     if agent is not None:
         with suppress(Exception):
             _api_server.request_hard_interrupt(agent, "Stop requested via API")
