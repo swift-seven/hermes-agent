@@ -1,0 +1,6 @@
+name: das-guard
+version: "1.0.0"
+description: "Lets a tool of the analyst's MCP server that is not marked readOnlyHint run only when DAS says the analyst allowed it for this chat; otherwise asks the analyst in a live turn and blocks it in a scheduled run."
+author: "DAS"
+provides_hooks:
+  - pre_tool_call
