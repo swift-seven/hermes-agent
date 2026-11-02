@@ -1097,6 +1097,78 @@ class TestSteerRun:
         assert f"run.{expected_status}" in events
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("result", "expected_status", "expected_reason", "expected_exit_reason"),
+        [
+            pytest.param(
+                {"final_response": "Rate limited.", "completed": False, "failed": True,
+                 "error": "429 Too Many Requests", "failure_reason": "rate_limit", "failure_retryable": True},
+                "failed", "rate_limit", None, id="provider_failure",
+            ),
+            pytest.param(
+                # compression.enabled: false — the overflow path stamps no turn_exit_reason.
+                {"final_response": "Too long.", "completed": False, "partial": True, "failed": True,
+                 "error": "Too long.", "compaction_disabled": True,
+                 "failure_reason": "context_overflow", "failure_retryable": False},
+                "failed", "context_overflow", None, id="overflow_compression_disabled",
+            ),
+            pytest.param(
+                {"final_response": "Too long.", "completed": False, "partial": True, "failed": True,
+                 "error": "Too long.", "compression_exhausted": True,
+                 "turn_exit_reason": "context_compression_exhausted",
+                 "failure_reason": "context_overflow", "failure_retryable": False},
+                "failed", "context_overflow", "context_compression_exhausted", id="overflow_compression_exhausted",
+            ),
+            pytest.param(
+                # Unfinished without ``failed``: reaches run.failed through the output-carrying branch.
+                {"final_response": "Cut off.", "completed": False, "partial": True,
+                 "error": "Response remained truncated", "failure_reason": "truncated", "failure_retryable": True},
+                "failed", "truncated", None, id="partial_truncated",
+            ),
+            pytest.param(
+                # Advisory verdict stamped on a turn that still finished.
+                {"final_response": "done", "completed": True,
+                 "failure_reason": "empty_response", "failure_retryable": True},
+                "completed", None, None, id="finished",
+            ),
+            pytest.param(
+                {"final_response": "Operation interrupted.", "interrupted": True, "completed": False,
+                 "failure_reason": "timeout"},
+                "cancelled", None, None, id="cancelled",
+            ),
+        ],
+    )
+    async def test_terminal_event_carries_failure_reason_only_when_failed(
+        self, adapter, result, expected_status, expected_reason, expected_exit_reason,
+    ):
+        """A failed run's terminal event and status carry the turn loop's ``failure_reason`` so a
+        client can tell a context overflow from other failures; other terminal statuses omit it."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_agent.run_conversation.return_value = result
+                mock_create.return_value = mock_agent
+
+                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start_resp.json())["run_id"]
+                body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
+        terminal = events[-1]
+        status = adapter._run_statuses[run_id]
+        assert terminal["event"] == f"run.{expected_status}"
+        assert status["status"] == expected_status
+        for payload in (terminal, status):
+            assert payload.get("failure_reason") == expected_reason
+            assert payload.get("turn_exit_reason") == expected_exit_reason
+        if expected_reason is None:
+            assert "failure_reason" not in terminal and "failure_reason" not in status
+
+    @pytest.mark.asyncio
     async def test_steer_requires_auth(self, auth_adapter):
         app = _create_runs_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:

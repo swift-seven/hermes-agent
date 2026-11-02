@@ -507,6 +507,40 @@ async def test_session_chat_stream_reports_interrupted_turn_as_not_completed(ada
     assert next(iter(adapter._run_statuses.values()))["status"] == "cancelled"
 
 
+@pytest.mark.asyncio
+async def test_session_chat_stream_failed_turn_carries_failure_reason(adapter, session_db):
+    """A failed turn's ``assistant.completed`` and ``run.failed`` payloads (and the run status)
+    carry the turn loop's ``failure_reason``, so a client can tell a context overflow apart."""
+    import json as _json
+
+    session_id = session_db.create_session("overflow-session", "api_server")
+
+    async def fake_run(**_kwargs):
+        return {"final_response": "Too long.", "completed": False, "partial": True, "failed": True,
+                "error": "Too long.", "compaction_disabled": True, "failure_reason": "context_overflow",
+                "failure_retryable": False, "session_id": session_id}, {"total_tokens": 1}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/api/sessions/{session_id}/chat/stream", json={"message": "hello"})
+            body = await resp.text()
+
+    payloads = {}
+    for block in body.split("\n\n"):
+        lines = block.splitlines()
+        event = next((ln[7:] for ln in lines if ln.startswith("event: ")), None)
+        data = next((ln[6:] for ln in lines if ln.startswith("data: ")), None)
+        if event and data:
+            payloads[event] = _json.loads(data)
+
+    assert "run.failed" in payloads and "run.completed" not in payloads
+    assert payloads["assistant.completed"]["failure_reason"] == "context_overflow"
+    assert payloads["run.failed"]["failure_reason"] == "context_overflow"
+    status = next(iter(adapter._run_statuses.values()))
+    assert status["status"] == "failed" and status["failure_reason"] == "context_overflow"
+
+
 # ---------------------------------------------------------------------------
 # Session-persisted model threading + provider-auth failure surfacing
 # (salvaged from PR #57947 by @FvanW and PR #59941 by @kaishi00)

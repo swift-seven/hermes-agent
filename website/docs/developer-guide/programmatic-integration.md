@@ -191,11 +191,13 @@ The terminal status of a run is derived from how the agent's turn actually ended
 |---|---|---|---|
 | Final answer produced | `completed` | `run.completed` | `completed: true` |
 | Interrupted (`/stop`, or an interrupt inside the agent) | `cancelled` | `run.cancelled` | `completed: false`, `interrupted: true`, `turn_exit_reason` naming the issuer — `interrupted_by_user` for a human stop, `interrupted_by_system(<issuer>)` / `interrupted_during_api_call(<issuer>)` when a watchdog (e.g. `cron_inactivity_watchdog`, `turn_liveness_watchdog`, `gateway_inactivity_watchdog`, `session_turn_lease_lost`) ended the turn |
-| Provider/agent failure | `failed` | `run.failed` | `completed: false`, `error` |
+| Provider/agent failure | `failed` | `run.failed` | `completed: false`, `error`, `failure_reason` when the turn loop classified it |
 | Gateway shut down while the run was active (`/v1/runs` only) | `interrupted` | `run.interrupted` | `error: "Gateway shutdown interrupted the run."` — recorded before the agent is interrupted and never overwritten by the turn's late result; a client `/stop` still settles as `cancelled` |
-| Ended without finishing (iteration budget, truncated or partial reply) | `failed` | `run.failed` | `completed: false`, `partial` when applicable, `turn_exit_reason` (e.g. `max_iterations_reached(60/60)`), `output` with any fallback text |
+| Ended without finishing (iteration budget, truncated or partial reply) | `failed` | `run.failed` | `completed: false`, `partial` when applicable, `turn_exit_reason` (e.g. `max_iterations_reached(60/60)`), `failure_reason` when the turn loop classified it, `output` with any fallback text |
 
-A run is never reported as `completed` with `completed: false` or `partial: true` in the same payload. The same rule applies to `/api/sessions/{id}/chat/stream`, whose `assistant.completed` payload carries the real `completed` / `partial` / `interrupted` flags and whose terminal event is `run.completed`, `run.failed`, or `run.cancelled`.
+`failure_reason` is the turn loop's typed verdict — a provider error class (`rate_limit`, `auth`, `timeout`, …) or a loop code such as `context_overflow` (the conversation did not fit even after compression, or compression is disabled), `truncated`, `loop_error` — and rides only on `failed` runs; it is absent when the run failed outside the turn loop (e.g. the agent could not be built).
+
+A run is never reported as `completed` with `completed: false` or `partial: true` in the same payload. The same rule applies to `/api/sessions/{id}/chat/stream`, whose `assistant.completed` payload carries the real `completed` / `partial` / `interrupted` flags (plus `failure_reason` on a failed turn, as on its `run.failed`) and whose terminal event is `run.completed`, `run.failed`, or `run.cancelled`.
 
 ---
 

@@ -184,7 +184,8 @@ def terminal_run_status(result: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     """Map a ``run_conversation`` result to its terminal run status and the wire fields every
     terminal event/status carries. An interrupted turn is ``cancelled``; a turn that ended
     without finishing (``failed``, ``partial``, or ``completed=False`` such as the iteration
-    budget) is ``failed``, so ``completed: true`` never rides next to ``partial: true``."""
+    budget) is ``failed``, so ``completed: true`` never rides next to ``partial: true``. A
+    ``failed`` status also carries the turn loop's typed ``failure_reason`` when it stamped one."""
     interrupted = bool(result.get("interrupted"))
     finished = (
         not interrupted and not result.get("failed") and not result.get("partial")
@@ -196,6 +197,12 @@ def terminal_run_status(result: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     }
     if not finished and result.get("turn_exit_reason"):
         fields["turn_exit_reason"] = str(result["turn_exit_reason"])
+    if status == "failed" and result.get("failure_reason"):
+        # The turn loop's typed verdict (e.g. a FailoverReason value, a SITE_FAILURE_CODES entry,
+        # ``session_persistence_failed:<cause>``): lets a client tell ``context_overflow`` from a
+        # provider failure without parsing ``error`` text, including the paths that set no
+        # ``turn_exit_reason`` (e.g. compression disabled).
+        fields["failure_reason"] = str(result["failure_reason"])
     if result.get("pending_steer"):
         # Undelivered steer text rides on every terminal event/status for client replay.
         fields["pending_steer"] = result["pending_steer"]
