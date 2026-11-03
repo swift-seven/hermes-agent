@@ -380,6 +380,33 @@ def test_ignores_conversational_future_offers():
     )
 
 
+def test_detects_trailing_ukrainian_and_russian_announcements():
+    plan = (
+        "Я застосую той самий алгоритм:\n\n"
+        "1.  **Послідовне повне вичитування:** прочитаю файл частинами від початку до кінця.\n"
+        "2.  **Тотальна екстракція:** витягну всі імена, телефони, адреси та документи.\n"
+        "3.  **Дедуплікація:** видалю повтори, але збережу всі унікальні формати запису.\n"
+        "4.  **Структурування:** розподілю дані за сферами українською мовою.\n"
+        "5.  **Перевірка:** звірю кожен факт із рядком файлу, з якого він узятий.\n\n"
+    )
+    assert len(plan) > 400
+    assert trailing_continue_intent(plan + "**Починаю повне зчитування файлу `звіт.docx`...**")
+    assert trailing_continue_intent("Розумію, потрібен глибший пошук.\n\nПочинаю пошук.")
+    assert trailing_continue_intent("Зараз перевірю файл.")
+    assert trailing_continue_intent("Сейчас проверю логи…")
+    assert trailing_continue_intent("Приступаю к анализу документа.")
+    assert trailing_continue_intent("Я починаю перевірку:")
+
+
+def test_ignores_ukrainian_and_russian_replies_that_are_done_or_wait_for_the_user():
+    assert not trailing_continue_intent("Я готовий.\n\nЧекаю на файл.")
+    assert not trailing_continue_intent("**Надайте ПІБ або файл для початку роботи.**")
+    assert not trailing_continue_intent("Зараз у файлі немає даних.")
+    assert not trailing_continue_intent("Тепер ясно, що даних немає.")
+    assert not trailing_continue_intent("Починаю пошук.\nЗнайдено три збіги: рядки 12, 40 і 77.")
+    assert not trailing_continue_intent(("* **Телефон:** +380000000000\n" * 80) + "Починаю пошук.")
+
+
 # ── batch-cycle loop breaker (port of can1357/oh-my-pi#10521) ───────────────
 
 

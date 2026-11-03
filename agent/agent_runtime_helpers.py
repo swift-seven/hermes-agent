@@ -3151,13 +3151,29 @@ _TRAILING_CONTINUE_INTENT_RE = re.compile(
 # Content longer than this is a substantive reply, not a dangling ack.
 _TRAILING_CONTINUE_INTENT_MAX_CHARS = 400
 
+_TRAILING_CONTINUE_INTENT_CYRILLIC_RE = re.compile(
+    r"^(?:я\s+)?"
+    r"(?:(?:починаю|розпочинаю|приступаю|переходжу|продовжую|беруся"
+    r"|начинаю|перехожу|продолжаю|берусь)\b"
+    r"|(?:зараз|тепер|сейчас|теперь)\s+(?:я\s+)?\w+[юу]\b)"
+    r"[^!?\n]{0,160}$",
+    re.IGNORECASE,
+)
+
+_TRAILING_CONTINUE_INTENT_CYRILLIC_MAX_CHARS = 2000
+
 
 def trailing_continue_intent(text: str) -> bool:
     """Whether ``text`` is a short reply ENDING on an announced next action (stall-guard re-prompt trigger)."""
     t = (text or "").strip()
-    if not t or len(t) > _TRAILING_CONTINUE_INTENT_MAX_CHARS:
+    if not t:
         return False
-    return bool(_TRAILING_CONTINUE_INTENT_RE.search(t[-160:]))
+    if len(t) <= _TRAILING_CONTINUE_INTENT_MAX_CHARS and _TRAILING_CONTINUE_INTENT_RE.search(t[-160:]):
+        return True
+    if len(t) > _TRAILING_CONTINUE_INTENT_CYRILLIC_MAX_CHARS:
+        return False
+    last_line = t.rsplit("\n", 1)[-1].strip(" \t*_`#>-")
+    return bool(_TRAILING_CONTINUE_INTENT_CYRILLIC_RE.match(last_line))
 
 
 # Broader tail detector for PROMOTED REASONING only (reasoning-only clean stop with tools offered
